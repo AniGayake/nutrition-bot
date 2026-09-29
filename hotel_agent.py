@@ -1,17 +1,20 @@
 import os
 import requests
+import asyncio
+import aiohttp
 import warnings
 from datetime import date
 from typing import Optional
-from google import genai
-from google.genai import types
 
-# Silence thought_signature SDK notice
+from aiohttp import web
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from google import genai
+from google.genai import types, errors
+
 warnings.filterwarnings("ignore", message=".*non-text parts in the response.*")
 
-# -------------------------------------------------------------------
-# 1. Scrape.do Google Hotels Integration
-# -------------------------------------------------------------------
+# 1. Scrape.do Tool Function
 def search_hotel_deals(
     location: str,
     check_in_date: str,
@@ -20,15 +23,10 @@ def search_hotel_deals(
     max_price_inr: Optional[float] = None,
     min_rating: Optional[float] = None
 ) -> dict:
-    """Scrapes hotel booking sites via Scrape.do Google Hotels plugin."""
-    print(f"\n[Scrape.do Executing] Searching {location} ({check_in_date} to {check_out_date})...")
-
     token = os.environ.get("SCRAPEDO_TOKEN")
     if not token:
-        print("[Error] SCRAPEDO_TOKEN is not set in environment!")
         return {"error": "SCRAPEDO_TOKEN is missing."}
 
-    # Scrape.do dedicated Google Hotels Ready-API endpoint
     url = "https://api.scrape.do/plugin/google/hotels"
     params = {
         "token": token,
@@ -43,21 +41,14 @@ def search_hotel_deals(
 
     try:
         response = requests.get(url, params=params, timeout=30)
-
         if response.status_code != 200:
-            print(f"[Scrape.do HTTP Error]: {response.status_code} - {response.text}")
-            return {"error": f"Scrape.do responded with code {response.status_code}: {response.text[:200]}"}
+            return {"error": f"Scrape.do HTTP error {response.status_code}: {response.text[:200]}"}
 
         data = response.json()
-
-        # Handle different response wrappers if returned as a list or dict
         properties = data.get("properties") or data.get("hotels") or (data if isinstance(data, list) else [])
 
         if not properties:
-            print(f"[Scrape.do Info]: No properties in payload. Keys: {list(data.keys()) if isinstance(data, dict) else 'List'}")
             return {"status": "no_results", "message": f"No hotels returned for {location}."}
-
-        print(f"[Scrape.do Success]: Retrieved {len(properties)} properties. Filtering best deals...")
 
         curated_deals = []
         for prop in properties:
@@ -65,7 +56,6 @@ def search_hotel_deals(
             rating = prop.get("rating") or prop.get("overall_rating", 0.0)
             reviews = prop.get("reviews") or prop.get("review_count", 0)
 
-            # Rating filter
             try:
                 numeric_rating = float(rating) if rating else 0.0
             except ValueError:
@@ -74,7 +64,6 @@ def search_hotel_deals(
             if min_rating and numeric_rating < min_rating:
                 continue
 
-            # Price extraction
             price_str = (
                 prop.get("price")
                 or prop.get("rate_per_night", {}).get("lowest")
@@ -86,11 +75,9 @@ def search_hotel_deals(
                 clean_num = ''.join(c for c in str(price_str) if c.isdigit())
                 numeric_price = float(clean_num) if clean_num else None
 
-            # Budget filter
             if max_price_inr and numeric_price and numeric_price > max_price_inr:
                 continue
 
-            # OTA booking comparisons
             prices_breakdown = []
             ota_deals = prop.get("prices") or prop.get("booking_providers", [])
             for deal in ota_deals:
@@ -117,30 +104,21 @@ def search_hotel_deals(
             "destination": location,
             "dates": f"{check_in_date} to {check_out_date}",
             "matches_found": len(curated_deals),
-            "hotels": curated_deals[:7]
+            "hotels": curated_deals[:6]
         }
-
     except Exception as e:
-        print(f"[Exception during scrape.do call]: {e}")
         return {"error": f"Failed fetching hotel deals: {str(e)}"}
 
-# -------------------------------------------------------------------
-# 2. Interactive Gemini Chat Runner
-# -------------------------------------------------------------------
-def main():
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("Please export GEMINI_API_KEY.")
+# 2. Gemini Agent
+gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-    client = genai.Client(api_key=api_key)
-
+def run_agent_query(user_query: str) -> str:
     today_str = str(date.today())
-
     chat_config = types.GenerateContentConfig(
         system_instruction=(
             f"You are a hotel deal aggregator agent.\n"
             f"CRITICAL DATE CONTEXT: Today's current date is {today_str}.\n"
-            "All travel dates must be future dates relative to today. Never query dates in 2024 or earlier.\n"
+            "All travel dates must be future dates relative to today. Never query dates in the past.\n"
             "When the user requests stays, invoke the `search_hotel_deals` tool.\n"
             "Present results in a clean Markdown comparison table: "
             "Hotel Name | Rating | Lowest Price | Provider.\n"
@@ -149,32 +127,84 @@ def main():
         tools=[search_hotel_deals],
     )
 
-    chat = client.chats.create(model="gemini-3.5-flash-lite", config=chat_config)
+    models_to_try = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
+    for model_name in models_to_try:
+        try:
+            chat = gemini_client.chats.create(model=model_name, config=chat_config)
+            response = chat.send_message(user_query)
+            return response.text
+        except errors.ServerError:
+            continue
+        except Exception as e:
+            return f"Error: {e}"
 
-    print("=" * 60)
-    print(f"🏨 Scrape.do Hotel Deal Agent Active! (Today: {today_str})")
-    print("Example: 'Find hotels in Goa for next weekend under 4500 INR'")
-    print("Type 'exit' to quit.")
-    print("=" * 60 + "\n")
+    return "All model endpoints are busy. Please try again in 1 minute."
+
+# 3. Telegram Message Handler
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    user_text = update.message.text
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    loop = asyncio.get_running_loop()
+    reply = await loop.run_in_executor(None, run_agent_query, user_text)
+    await update.message.reply_text(reply)
+
+# 4. HTTP Health Check & Self-Pinger for Render
+async def health_check(request):
+    return web.Response(text="Hotel Deal Agent is live!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Health server listening on port {port}")
+
+async def keep_alive_ping():
+    """Pings itself every 10 minutes to stay awake on Render free tier."""
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not render_url:
+        return
+    if not render_url.startswith("http"):
+        render_url = f"https://{render_url}"
+
+    await asyncio.sleep(60)
+    print(f"[Keep-Alive] Starting pinger on {render_url}")
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(render_url, timeout=15) as resp:
+                    print(f"[Keep-Alive] Ping: Status {resp.status}")
+            except Exception as e:
+                print(f"[Keep-Alive Ping Failed]: {e}")
+            await asyncio.sleep(600)
+
+# 5. Main Entrypoint (NO input() calls!)
+async def main():
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not bot_token:
+        raise ValueError("Missing TELEGRAM_BOT_TOKEN")
+
+    await start_web_server()
+    asyncio.create_task(keep_alive_ping())
+
+    telegram_app = ApplicationBuilder().token(bot_token).build()
+    telegram_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+
+    print("Hotel Telegram Agent is polling...")
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.updater.start_polling(drop_pending_updates=True)
 
     while True:
-        try:
-            user_input = input("You: ").strip()
-            if not user_input:
-                continue
-            if user_input.lower() in ("exit", "quit", "q"):
-                print("\nGoodbye!")
-                break
-
-            response = chat.send_message(user_input)
-            print(f"\nAgent:\n{response.text}\n")
-            print("-" * 60)
-
-        except KeyboardInterrupt:
-            print("\nSession stopped.")
-            break
-        except Exception as e:
-            print(f"\n[Error]: {e}\n")
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
