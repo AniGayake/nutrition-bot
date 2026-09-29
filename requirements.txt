@@ -1,4 +1,5 @@
 google-genai
+requests
 pydantic
 python-telegram-bot
 aiohttp
