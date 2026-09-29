@@ -1,0 +1,4 @@
+google-genai
+pydantic
+python-telegram-bot
+aiohttp
